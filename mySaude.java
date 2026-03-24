@@ -1,6 +1,11 @@
 import java.io.*;
 import java.net.*;
+import java.nio.file.Files;
+import java.security.*;
+import java.security.cert.Certificate;
 import java.util.*;
+import javax.crypto.*;
+import javax.crypto.spec.*;
 
 public class mySaude {
 
@@ -118,12 +123,12 @@ public class mySaude {
             case "-c":
                 if (target == null) { System.err.println("Error: -t <destinatario> is required for -c"); System.exit(1); }
                 if (password == null) { System.err.println("Error: -p <password> is required for -c"); System.exit(1); }
-                System.err.println("Command -c not yet implemented.");
+                encryptFiles(username, password, files, target);
                 break;
 
             case "-d":
                 if (password == null) { System.err.println("Error: -p <password> is required for -d"); System.exit(1); }
-                System.err.println("Command -d not yet implemented.");
+                decryptFiles(username, password, files);
                 break;
 
             case "-ce":
@@ -339,6 +344,223 @@ public class mySaude {
             System.err.println("Error: cannot connect to server at " + host + ":" + port);
         } catch (IOException | ClassNotFoundException e) {
             System.err.println("Error communicating with server: " + e.getMessage());
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // -c : hybrid encryption  (AES-128/CBC + RSA-2048)
+    //
+    // For each file:
+    //   1. Generate random AES-128 key and IV
+    //   2. Encrypt file  → <file>.cifrado   (IV prepended, 16 bytes)
+    //   3. Encrypt AES key with recipient's RSA public key (from keystore)
+    //                    → <file>.chave.<target>
+    //
+    // Keystore used: keystore.<username>  (PKCS12, alias = username)
+    // Recipient's certificate must be imported with alias = target username
+    // -------------------------------------------------------------------------
+
+    static void encryptFiles(String username, String password,
+                             List<String> files, String target) {
+        KeyStore ks = loadKeyStore(username, password);
+        if (ks == null) return;
+
+        // Get recipient's public key from their certificate stored in our keystore
+        Certificate cert;
+        try {
+            cert = ks.getCertificate(target);
+        } catch (KeyStoreException e) {
+            System.err.println("Error accessing keystore: " + e.getMessage());
+            return;
+        }
+        if (cert == null) {
+            System.err.println("Error: certificate for '" + target + "' not found in keystore." +
+                " Import it first: keytool -importcert -alias " + target +
+                " -keystore keystore." + username + " -file " + target + ".cer");
+            return;
+        }
+        PublicKey recipientPublicKey = cert.getPublicKey();
+
+        for (String filePath : files) {
+            File inputFile = new File(filePath);
+
+            if (!inputFile.exists() || !inputFile.isFile()) {
+                System.err.println("Error: file not found: " + filePath);
+                continue;
+            }
+
+            String filename     = inputFile.getName();
+            File encryptedFile  = new File(filename + ".cifrado");
+            File keyFile        = new File(filename + ".chave." + target);
+
+            if (encryptedFile.exists()) {
+                System.err.println("Error: '" + encryptedFile.getName() + "' already exists. Skipping.");
+                continue;
+            }
+
+            try {
+                // 1. Generate AES-128 key and random IV
+                KeyGenerator kg = KeyGenerator.getInstance("AES");
+                kg.init(128);
+                SecretKey aesKey = kg.generateKey();
+
+                byte[] iv = new byte[16];
+                new SecureRandom().nextBytes(iv);
+                IvParameterSpec ivSpec = new IvParameterSpec(iv);
+
+                // 2. Encrypt file: IV (16 bytes) || ciphertext  → <file>.cifrado
+                Cipher aesCipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                aesCipher.init(Cipher.ENCRYPT_MODE, aesKey, ivSpec);
+
+                try (FileInputStream  fis = new FileInputStream(inputFile);
+                     FileOutputStream fos = new FileOutputStream(encryptedFile)) {
+                    fos.write(iv);                           // prepend IV
+                    byte[] buf = new byte[BUFFER_SIZE];
+                    int n;
+                    while ((n = fis.read(buf)) != -1) {
+                        byte[] block = aesCipher.update(buf, 0, n);
+                        if (block != null) fos.write(block);
+                    }
+                    byte[] last = aesCipher.doFinal();
+                    if (last != null) fos.write(last);
+                }
+
+                // 3. Encrypt AES key with RSA public key of recipient → <file>.chave.<target>
+                Cipher rsaCipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+                rsaCipher.init(Cipher.ENCRYPT_MODE, recipientPublicKey);
+                byte[] encryptedKey = rsaCipher.doFinal(aesKey.getEncoded());
+
+                try (FileOutputStream kos = new FileOutputStream(keyFile)) {
+                    kos.write(encryptedKey);
+                }
+
+                System.out.println("Encrypted: " + encryptedFile.getName()
+                                 + " + " + keyFile.getName());
+
+            } catch (Exception e) {
+                System.err.println("Error encrypting '" + filename + "': " + e.getMessage());
+                encryptedFile.delete();
+                keyFile.delete();
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // -d : hybrid decryption
+    //
+    // For each <file>.cifrado:
+    //   1. Find <file>.chave.<username>
+    //   2. Decrypt the AES key with the user's RSA private key (from keystore)
+    //   3. Read IV from first 16 bytes of .cifrado
+    //   4. Decrypt ciphertext with AES/CBC/PKCS5Padding  → <file>
+    // -------------------------------------------------------------------------
+
+    static void decryptFiles(String username, String password, List<String> files) {
+        KeyStore ks = loadKeyStore(username, password);
+        if (ks == null) return;
+
+        // Get user's RSA private key
+        PrivateKey privateKey;
+        try {
+            privateKey = (PrivateKey) ks.getKey(username, password.toCharArray());
+        } catch (Exception e) {
+            System.err.println("Error retrieving private key from keystore: " + e.getMessage());
+            return;
+        }
+        if (privateKey == null) {
+            System.err.println("Error: private key for '" + username + "' not found in keystore.");
+            return;
+        }
+
+        for (String filePath : files) {
+            if (!filePath.endsWith(".cifrado")) {
+                System.err.println("Error: '" + filePath + "' does not end in .cifrado. Skipping.");
+                continue;
+            }
+
+            File encryptedFile = new File(filePath);
+            if (!encryptedFile.exists() || !encryptedFile.isFile()) {
+                System.err.println("Error: file not found: " + filePath);
+                continue;
+            }
+
+            String encName   = encryptedFile.getName();
+            String baseName  = encName.substring(0, encName.length() - ".cifrado".length());
+            File keyFile     = new File(baseName + ".chave." + username);
+            File outputFile  = new File(baseName);
+
+            if (!keyFile.exists()) {
+                System.err.println("Error: key file not found: " + keyFile.getName()
+                                 + ". Cannot decrypt " + encName + ".");
+                continue;
+            }
+            if (outputFile.exists()) {
+                System.err.println("Error: output file '" + baseName + "' already exists. Skipping.");
+                continue;
+            }
+
+            try {
+                // 1. Read and decrypt the AES key with RSA private key
+                byte[] encryptedKey = Files.readAllBytes(keyFile.toPath());
+                Cipher rsaCipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
+                rsaCipher.init(Cipher.DECRYPT_MODE, privateKey);
+                byte[] aesKeyBytes = rsaCipher.doFinal(encryptedKey);
+                SecretKeySpec aesKey = new SecretKeySpec(aesKeyBytes, "AES");
+
+                // 2. Read IV (first 16 bytes) and decrypt the rest
+                try (FileInputStream  fis = new FileInputStream(encryptedFile);
+                     FileOutputStream fos = new FileOutputStream(outputFile)) {
+
+                    byte[] iv = new byte[16];
+                    if (fis.read(iv) != 16) {
+                        throw new IOException("Invalid .cifrado file: could not read IV.");
+                    }
+                    IvParameterSpec ivSpec = new IvParameterSpec(iv);
+
+                    Cipher aesCipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                    aesCipher.init(Cipher.DECRYPT_MODE, aesKey, ivSpec);
+
+                    byte[] buf = new byte[BUFFER_SIZE];
+                    int n;
+                    while ((n = fis.read(buf)) != -1) {
+                        byte[] block = aesCipher.update(buf, 0, n);
+                        if (block != null) fos.write(block);
+                    }
+                    byte[] last = aesCipher.doFinal();
+                    if (last != null) fos.write(last);
+                }
+
+                System.out.println("Decrypted: " + baseName);
+
+            } catch (Exception e) {
+                System.err.println("Error decrypting '" + encName + "': " + e.getMessage());
+                outputFile.delete();
+            }
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Keystore loader — shared by -c, -d, -a, -v
+    //
+    // File: keystore.<username>  (PKCS12 format)
+    // Alias for private key and own certificate: <username>
+    // Aliases for other users' certificates: <their_username>
+    // -------------------------------------------------------------------------
+
+    static KeyStore loadKeyStore(String username, String password) {
+        String ksPath = "keystore." + username;
+        File ksFile = new File(ksPath);
+        if (!ksFile.exists()) {
+            System.err.println("Error: keystore not found: " + ksPath);
+            return null;
+        }
+        try (FileInputStream fis = new FileInputStream(ksFile)) {
+            KeyStore ks = KeyStore.getInstance("PKCS12");
+            ks.load(fis, password.toCharArray());
+            return ks;
+        } catch (Exception e) {
+            System.err.println("Error loading keystore '" + ksPath + "': " + e.getMessage());
+            return null;
         }
     }
 
