@@ -1,223 +1,241 @@
 /***************************************************************************
 *   Seguranca Informatica
-*
-*
+*   mySaudeServer - versão base para TP1
+*   Suporta operações SEND e RECEIVE sem autenticação
 ***************************************************************************/
-import java.io.*;
+
+import java.io.EOFException;
+import java.io.File;
+import java.io.FileInputStream;
+import java.io.FileOutputStream;
+import java.io.IOException;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 
 public class mySaudeServer {
 
-    private static final String EXPECTED_USER = "user";
-    private static final String EXPECTED_PASS = "pass";
+    private static final String STORAGE_DIR = "server_storage";
+    private static final int BUFFER_SIZE = 4096;
 
-    // Minimal change: promote ServerSocket to a field so it can be closed from shutdown hook
-    private ServerSocket sSoc = null;
+    private ServerSocket serverSocket = null;
 
     public static void main(String[] args) {
-        int port = 23456; // default port
-        if (args != null && args.length > 0) {
-            try {
-                port = Integer.parseInt(args[0]);
-                if (port < 1 || port > 65535) {
-                    System.err.println("Invalid port number. Using default 23456.");
-                    port = 23456;
-                }
-            } catch (NumberFormatException e) {
-                System.err.println("Invalid port argument. Using default 23456.");
-                port = 23456;
+        if (args.length != 1) {
+            System.out.println("Uso: java mySaudeServer <porto>");
+            return;
+        }
+
+        int port;
+        try {
+            port = Integer.parseInt(args[0]);
+            if (port < 1 || port > 65535) {
+                System.out.println("Porto inválido. Use um valor entre 1 e 65535.");
+                return;
             }
-        } else {
-            System.out.println("No port argument provided. Using default port 23456.");
+        } catch (NumberFormatException e) {
+            System.out.println("Porto inválido: " + args[0]);
+            return;
         }
 
         mySaudeServer server = new mySaudeServer();
-
-        // Minimal shutdown hook to close the ServerSocket on JVM exit
-        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
-            System.out.println("Shutdown hook: closing ServerSocket...");
-            try {
-                if (server.sSoc != null && !server.sSoc.isClosed()) {
-                    server.sSoc.close();
-                }
-            } catch (IOException e) {
-                System.err.println("Error closing ServerSocket in shutdown hook: " + e.getMessage());
-            }
-        }));
-
         server.startServer(port);
     }
 
     public void startServer(int port) {
-        try {
-            sSoc = new ServerSocket(port);
-            System.out.println("Server listening on port " + port);
-        } catch (IOException e) {
-            System.err.println("Failed to open ServerSocket on port " + port + ": " + e.getMessage());
-            System.exit(-1);
-        }
+        createBaseStorage();
 
         try {
+            serverSocket = new ServerSocket(port);
+            System.out.println("Servidor à escuta no porto " + port);
+
             while (true) {
-                try {
-                    Socket inSoc = sSoc.accept();
-                    ServerThread newServerThread = new ServerThread(inSoc);
-                    newServerThread.start();
-                } catch (IOException e) {
-                    // If sSoc was closed (e.g., by shutdown hook), accept() will throw.
-                    if (sSoc == null || sSoc.isClosed()) {
-                        System.out.println("ServerSocket closed, stopping accept loop.");
-                        break;
-                    } else {
-                        e.printStackTrace();
-                    }
-                }
+                Socket clientSocket = serverSocket.accept();
+                new ServerThread(clientSocket).start();
             }
+        } catch (IOException e) {
+            System.err.println("Erro no servidor: " + e.getMessage());
         } finally {
-            // ensure ServerSocket is closed if startServer exits for any reason
-            if (sSoc != null && !sSoc.isClosed()) {
+            if (serverSocket != null && !serverSocket.isClosed()) {
                 try {
-                    sSoc.close();
-                } catch (IOException ignored) {}
+                    serverSocket.close();
+                } catch (IOException ignored) {
+                }
             }
         }
     }
 
-    // Threads used for communication with clients
+    private void createBaseStorage() {
+        File baseDir = new File(STORAGE_DIR);
+        if (!baseDir.exists() && !baseDir.mkdirs()) {
+            System.err.println("Aviso: não foi possível criar a pasta base " + STORAGE_DIR);
+        }
+    }
+
     class ServerThread extends Thread {
+        private final Socket socket;
 
-        private Socket socket = null;
-        private static final int BUFFER_SIZE = 4096;
-
-        ServerThread(Socket inSoc) {
-            socket = inSoc;
-            System.out.println("Cliente novo: " + socket.getRemoteSocketAddress() + ", nova thread criada");
+        ServerThread(Socket socket) {
+            this.socket = socket;
+            System.out.println("Novo cliente ligado: " + socket.getRemoteSocketAddress());
         }
 
+        @Override
         public void run() {
-            ObjectOutputStream outStream = null;
-            ObjectInputStream inStream = null;
+            ObjectOutputStream out = null;
+            ObjectInputStream in = null;
 
             try {
-                // Create ObjectOutputStream first, then ObjectInputStream (match client)
-                outStream = new ObjectOutputStream(socket.getOutputStream());
-                outStream.flush();
-                inStream = new ObjectInputStream(socket.getInputStream());
+                out = new ObjectOutputStream(socket.getOutputStream());
+                out.flush();
+                in = new ObjectInputStream(socket.getInputStream());
 
-                String user = null;
-                String passwd = null;
+                String command = (String) in.readObject();
 
-				try {
-					user = (String) inStream.readObject();
-					passwd = (String) inStream.readObject();
-					System.out.println("Cliente autenticado como user: " + user);
-				} catch (EOFException eof) {
-					// orderly close by client before sending credentials
-					System.out.println("Cliente fechou conecção antes de autenticar");
-					return;
-				} catch (java.net.SocketException se) {
-					// connection reset / abort by client
-					System.out.println("Cliente fechou conecção antes de autenticar");
-					return;
-				} catch (IOException ioe) {
-					// other I/O errors while reading credentials
-					System.err.println("I/O error while reading credentials: " + ioe.getMessage());
-					ioe.printStackTrace();
-					return;
-				} catch (ClassNotFoundException e1) {
-					e1.printStackTrace();
-					return;
-				}
-
-                // Authentication check: only accept EXPECTED_USER / EXPECTED_PASS
-                boolean authOk = EXPECTED_USER.equals(user) && EXPECTED_PASS.equals(passwd);
-                outStream.writeObject(Boolean.valueOf(authOk));
-                outStream.flush();
-
-                if (!authOk) {
-                    System.out.println("Authentication failed for user: " + user);
-                    return; // close connection
+                if ("SEND".equals(command)) {
+                    handleSend(in, out);
+                } else if ("RECEIVE".equals(command)) {
+                    handleReceive(in, out);
+                } else {
+                    out.writeObject("ERROR: comando inválido");
+                    out.flush();
                 }
 
-                // --- After authentication: receive a file ---
-                // Protocol expected from client:
-                // 1) client sends filename as String (Object)
-                // 2) client sends file size as Long (Object)
-                // 3) client sends raw file bytes (write(byte[],off,len) repeatedly)
-                // 4) client sends an additional String (Object) after bytes
-
-                try {
-                    Object objFilename = inStream.readObject();
-                    if (!(objFilename instanceof String)) {
-                        outStream.writeObject("ERROR: expected filename String");
-                        outStream.flush();
-                        return;
-                    }
-
-                    String filename = (String) objFilename;
-                    System.out.println("Receiving file: " + filename);
-
-                    Object objSize = inStream.readObject();
-                    if (!(objSize instanceof Long)) {
-                        outStream.writeObject("ERROR: expected file size Long");
-                        outStream.flush();
-                        return;
-                    }
-
-                    long fileSize = (Long) objSize;
-                    System.out.println("Declared file size: " + fileSize + " bytes");
-
-                    File outFile = new File("server_received_" + filename);
-                    try (FileOutputStream fos = new FileOutputStream(outFile)) {
-                        byte[] buffer = new byte[BUFFER_SIZE];
-                        long remaining = fileSize;
-                        while (remaining > 0) {
-                            int toRead = (int) Math.min(buffer.length, remaining);
-                            int read = inStream.read(buffer, 0, toRead);
-                            if (read == -1) {
-                                throw new EOFException("Unexpected end of stream while receiving file");
-                            }
-                            fos.write(buffer, 0, read);
-                            remaining -= read;
-                        }
-                        fos.flush();
-                    }
-
-                    System.out.println("File saved as: " + outFile.getAbsolutePath());
-
-                    Object objExtra = inStream.readObject();
-                    if (objExtra instanceof String) {
-                        String extra = (String) objExtra;
-                        System.out.println("Received additional string from client: " + extra);
-                        outStream.writeObject("ACK: received file " + filename + " (" + fileSize + " bytes) and message: " + extra);
-                        outStream.flush();
-                    } else {
-                        outStream.writeObject("ERROR: expected extra String after file");
-                        outStream.flush();
-                    }
-
-                    System.out.println("Transfer complete, closing connection with client: " + socket.getRemoteSocketAddress());
-                } catch (EOFException eof) {
-                    System.out.println("Cliente fechou conecção durante transferência de ficheiro (EOF)");
-                    return;
-                } catch (java.net.SocketException sockEx) {
-                    System.out.println("Socket reset/closed by client after auth (need no file upload): " + sockEx.getMessage());
-                    return;
-                } catch (ClassNotFoundException cnf) {
-                    System.err.println("ClassNotFound while parsing post-auth object: " + cnf.getMessage());
-                    cnf.printStackTrace();
-                    return;
-                }
-
-
-            } catch (IOException e) {
-                System.err.println("I/O error in ServerThread: " + e.getMessage());
-                e.printStackTrace();
+            } catch (EOFException e) {
+                System.out.println("Ligação terminada pelo cliente: " + socket.getRemoteSocketAddress());
+            } catch (Exception e) {
+                System.err.println("Erro na thread do cliente " + socket.getRemoteSocketAddress() + ": " + e.getMessage());
             } finally {
-                try { if (inStream != null) inStream.close(); } catch (IOException ignored) {}
-                try { if (outStream != null) outStream.close(); } catch (IOException ignored) {}
-                try { if (socket != null && !socket.isClosed()) socket.close(); } catch (IOException ignored) {}
+                try {
+                    if (in != null) {
+                        in.close();
+                    }
+                } catch (IOException ignored) {
+                }
+                try {
+                    if (out != null) {
+                        out.close();
+                    }
+                } catch (IOException ignored) {
+                }
+                try {
+                    if (socket != null && !socket.isClosed()) {
+                        socket.close();
+                    }
+                } catch (IOException ignored) {
+                }
+            }
+        }
+
+        private void handleSend(ObjectInputStream in, ObjectOutputStream out) throws Exception {
+            String senderUser = (String) in.readObject();
+            String targetUser = (String) in.readObject();
+            int fileCount = in.readInt();
+
+            System.out.println("Pedido SEND de '" + senderUser + "' para '" + targetUser + "' com " + fileCount + " ficheiro(s)");
+
+            File targetDir = new File(STORAGE_DIR, targetUser);
+            if (!targetDir.exists() || !targetDir.isDirectory()) {
+                for (int i = 0; i < fileCount; i++) {
+                    String filename = (String) in.readObject();
+                    long fileSize = in.readLong();
+                    discardBytes(in, fileSize);
+                    out.writeObject("ERROR: diretoria do utilizador destino não existe para o ficheiro " + filename);
+                    out.flush();
+                }
+                return;
+            }
+
+            for (int i = 0; i < fileCount; i++) {
+                String filename = (String) in.readObject();
+                long fileSize = in.readLong();
+
+                File destinationFile = new File(targetDir, filename);
+
+                if (destinationFile.exists()) {
+                    discardBytes(in, fileSize);
+                    out.writeObject("ERROR: o ficheiro '" + filename + "' já existe no servidor");
+                    out.flush();
+                    continue;
+                }
+
+                try (FileOutputStream fos = new FileOutputStream(destinationFile)) {
+                    byte[] buffer = new byte[BUFFER_SIZE];
+                    long remaining = fileSize;
+
+                    while (remaining > 0) {
+                        int bytesToRead = (int) Math.min(buffer.length, remaining);
+                        int bytesRead = in.read(buffer, 0, bytesToRead);
+
+                        if (bytesRead == -1) {
+                            throw new EOFException("Fim inesperado da stream ao receber '" + filename + "'");
+                        }
+
+                        fos.write(buffer, 0, bytesRead);
+                        remaining -= bytesRead;
+                    }
+                }
+
+                out.writeObject("OK: ficheiro '" + filename + "' guardado para o utilizador '" + targetUser + "'");
+                out.flush();
+            }
+        }
+
+        private void handleReceive(ObjectInputStream in, ObjectOutputStream out) throws Exception {
+            String user = (String) in.readObject();
+            int fileCount = in.readInt();
+
+            System.out.println("Pedido RECEIVE do utilizador '" + user + "' com " + fileCount + " ficheiro(s)");
+
+            File userDir = new File(STORAGE_DIR, user);
+
+            for (int i = 0; i < fileCount; i++) {
+                String filename = (String) in.readObject();
+
+                if (!userDir.exists() || !userDir.isDirectory()) {
+                    out.writeObject("ERROR");
+                    out.writeObject(filename);
+                    out.writeObject("A diretoria do utilizador não existe no servidor");
+                    out.flush();
+                    continue;
+                }
+
+                File requestedFile = new File(userDir, filename);
+                if (!requestedFile.exists() || !requestedFile.isFile()) {
+                    out.writeObject("ERROR");
+                    out.writeObject(filename);
+                    out.writeObject("O ficheiro não existe no servidor");
+                    out.flush();
+                    continue;
+                }
+
+                out.writeObject("OK");
+                out.writeObject(filename);
+                out.writeLong(requestedFile.length());
+
+                try (FileInputStream fis = new FileInputStream(requestedFile)) {
+                    byte[] buffer = new byte[BUFFER_SIZE];
+                    int bytesRead;
+                    while ((bytesRead = fis.read(buffer)) != -1) {
+                        out.write(buffer, 0, bytesRead);
+                    }
+                }
+                out.flush();
+            }
+        }
+
+        private void discardBytes(ObjectInputStream in, long bytesToSkip) throws IOException {
+            byte[] buffer = new byte[BUFFER_SIZE];
+            long remaining = bytesToSkip;
+
+            while (remaining > 0) {
+                int bytesToRead = (int) Math.min(buffer.length, remaining);
+                int bytesRead = in.read(buffer, 0, bytesToRead);
+                if (bytesRead == -1) {
+                    throw new EOFException("Fim inesperado da stream ao descartar bytes");
+                }
+                remaining -= bytesRead;
             }
         }
     }
