@@ -180,65 +180,57 @@ public class mySaude {
 
     // -------------------------------------------------------------------------
     // -e : send files to the server (into the target user's directory)
+    //
+    // Protocol (must match mySaudeServer.handleSend):
+    //   C→S  "SEND"
+    //   C→S  senderUsername   (writeObject)
+    //   C→S  targetUsername   (writeObject)
+    //   C→S  fileCount        (writeInt)
+    //   for each file:
+    //     C→S  filename       (writeObject)
+    //     C→S  fileSize       (writeLong)
+    //     C→S  <bytes>        (write)
+    //     S→C  "OK:..."  or  "ERROR:..."  (readObject)
     // -------------------------------------------------------------------------
 
     static void sendFiles(String host, int port, String username,
                           List<String> files, String target) {
+
+        // Client-side check: filter files that don't exist locally before connecting
+        List<File> validFiles = new ArrayList<>();
+        for (String filePath : files) {
+            File f = new File(filePath);
+            if (!f.exists() || !f.isFile()) {
+                System.err.println("Error: file not found locally: " + filePath);
+            } else {
+                validFiles.add(f);
+            }
+        }
+
+        if (validFiles.isEmpty()) {
+            System.out.println("No valid files to send.");
+            return;
+        }
+
         try (Socket socket = new Socket(host, port)) {
             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
             out.flush();
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
-            // 1. Announce command, sender and target
+            // 1. Command + sender + target + number of files
             out.writeObject("SEND");
             out.writeObject(username);
             out.writeObject(target);
+            out.writeInt(validFiles.size());
             out.flush();
 
-            // 2. Server checks whether the target directory exists
-            String dirResp = (String) in.readObject();
-            if ("ERR_NO_DIR".equals(dirResp)) {
-                System.err.println("Error: directory for user '" + target + "' does not exist on server.");
-                return;
-            }
-            if (!"OK".equals(dirResp)) {
-                System.err.println("Unexpected response from server: " + dirResp);
-                return;
-            }
-
-            // 3. Send each file
-            for (String filePath : files) {
-                File file = new File(filePath);
+            // 2. Send each file and read the server's per-file response
+            for (File file : validFiles) {
                 String filename = file.getName();
+                long fileSize   = file.length();
 
-                // Client-side check: file must exist locally
-                if (!file.exists() || !file.isFile()) {
-                    System.err.println("Error: file not found locally: " + filePath);
-                    // Tell the server we are skipping this file
-                    out.writeObject("SKIP");
-                    out.flush();
-                    continue;
-                }
-
-                // Propose the filename to the server
                 out.writeObject(filename);
-                out.flush();
-
-                // Server checks for duplicates / conflicts
-                String fileResp = (String) in.readObject();
-                if ("ERR_FILE_EXISTS".equals(fileResp)) {
-                    System.err.println("Error: file '" + filename + "' already exists on server for user '" + target + "'.");
-                    continue;
-                }
-                if (!"OK".equals(fileResp)) {
-                    System.err.println("Error from server for file '" + filename + "': " + fileResp);
-                    continue;
-                }
-
-                // Send file size then raw bytes
-                long fileSize = file.length();
-                out.writeObject(fileSize);
-                out.flush();
+                out.writeLong(fileSize);
 
                 try (FileInputStream fis = new FileInputStream(file)) {
                     byte[] buffer = new byte[BUFFER_SIZE];
@@ -249,18 +241,14 @@ public class mySaude {
                     out.flush();
                 }
 
-                // Wait for acknowledgement
-                String ack = (String) in.readObject();
-                if ("ACK".equals(ack)) {
+                // Server replies "OK: ..." or "ERROR: ..." for every file
+                String response = (String) in.readObject();
+                if (response.startsWith("OK")) {
                     System.out.println("Sent: " + filename);
                 } else {
-                    System.err.println("Error sending file '" + filename + "': " + ack);
+                    System.err.println("Error for '" + filename + "': " + response);
                 }
             }
-
-            // 4. Signal end of transfer
-            out.writeObject("DONE");
-            out.flush();
 
         } catch (ConnectException e) {
             System.err.println("Error: cannot connect to server at " + host + ":" + port);
@@ -271,80 +259,81 @@ public class mySaude {
 
     // -------------------------------------------------------------------------
     // -r : receive files from the server (from the caller's own directory)
+    //
+    // Protocol (must match mySaudeServer.handleReceive):
+    //   C→S  "RECEIVE"
+    //   C→S  username         (writeObject)
+    //   C→S  fileCount        (writeInt)
+    //   for each file:
+    //     C→S  filename       (writeObject)
+    //     S→C  "OK" or "ERROR"  (readObject)
+    //     S→C  filename         (readObject)   — always echoed back
+    //     if OK:
+    //       S→C  fileSize     (readLong)
+    //       S→C  <bytes>      (read)
+    //     if ERROR:
+    //       S→C  errorMessage (readObject)
     // -------------------------------------------------------------------------
 
     static void receiveFiles(String host, int port, String username, List<String> files) {
+
+        // Client-side check: skip files that already exist locally before connecting
+        List<String> toReceive = new ArrayList<>();
+        for (String filePath : files) {
+            String filename = new File(filePath).getName();
+            if (new File(filename).exists()) {
+                System.err.println("Error: file '" + filename + "' already exists locally. Skipping.");
+            } else {
+                toReceive.add(filename);
+            }
+        }
+
+        if (toReceive.isEmpty()) {
+            System.out.println("No files to receive.");
+            return;
+        }
+
         try (Socket socket = new Socket(host, port)) {
             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
             out.flush();
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
-            // 1. Announce command and username
+            // 1. Command + username + number of files
             out.writeObject("RECEIVE");
             out.writeObject(username);
+            out.writeInt(toReceive.size());
             out.flush();
 
-            // 2. Server checks whether the user directory exists
-            String dirResp = (String) in.readObject();
-            if ("ERR_NO_DIR".equals(dirResp)) {
-                System.err.println("Error: directory for user '" + username + "' does not exist on server.");
-                return;
-            }
-            if (!"OK".equals(dirResp)) {
-                System.err.println("Unexpected response from server: " + dirResp);
-                return;
-            }
-
-            // 3. Request each file
-            for (String filePath : files) {
-                String filename = new File(filePath).getName();
-
-                // Check if the file already exists locally
-                File localFile = new File(filename);
-                if (localFile.exists()) {
-                    System.err.println("Error: file '" + filename + "' already exists locally. Skipping.");
-                    out.writeObject("SKIP");
-                    out.flush();
-                    continue;
-                }
-
+            // 2. Request each file and read the server's response
+            for (String filename : toReceive) {
                 out.writeObject(filename);
                 out.flush();
 
-                // Server responds with status
-                String fileResp = (String) in.readObject();
-                if ("ERR_FILE_NOT_FOUND".equals(fileResp)) {
-                    System.err.println("Error: file '" + filename + "' does not exist on server for user '" + username + "'.");
-                    continue;
-                }
-                if (!"OK".equals(fileResp)) {
-                    System.err.println("Error from server for file '" + filename + "': " + fileResp);
-                    continue;
-                }
+                String status       = (String) in.readObject();
+                String echoFilename = (String) in.readObject(); // server always echoes the filename
 
-                // Receive file size then raw bytes
-                long fileSize = (Long) in.readObject();
+                if ("OK".equals(status)) {
+                    long fileSize = in.readLong();
+                    File localFile = new File(echoFilename);
 
-                try (FileOutputStream fos = new FileOutputStream(localFile)) {
-                    byte[] buffer = new byte[BUFFER_SIZE];
-                    long remaining = fileSize;
-                    while (remaining > 0) {
-                        int toRead = (int) Math.min(buffer.length, remaining);
-                        int read = in.read(buffer, 0, toRead);
-                        if (read == -1) throw new EOFException("Unexpected end of stream receiving " + filename);
-                        fos.write(buffer, 0, read);
-                        remaining -= read;
+                    try (FileOutputStream fos = new FileOutputStream(localFile)) {
+                        byte[] buffer = new byte[BUFFER_SIZE];
+                        long remaining = fileSize;
+                        while (remaining > 0) {
+                            int toRead = (int) Math.min(buffer.length, remaining);
+                            int read = in.read(buffer, 0, toRead);
+                            if (read == -1) throw new EOFException("Unexpected EOF receiving " + echoFilename);
+                            fos.write(buffer, 0, read);
+                            remaining -= read;
+                        }
                     }
+                    System.out.println("Received: " + echoFilename);
+
+                } else {
+                    String errorMsg = (String) in.readObject();
+                    System.err.println("Error for '" + echoFilename + "': " + errorMsg);
                 }
-
-                out.writeObject("ACK");
-                out.flush();
-                System.out.println("Received: " + filename);
             }
-
-            // 4. Signal end
-            out.writeObject("DONE");
-            out.flush();
 
         } catch (ConnectException e) {
             System.err.println("Error: cannot connect to server at " + host + ":" + port);

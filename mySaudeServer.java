@@ -153,9 +153,11 @@ public class mySaudeServer {
 
                 File destinationFile = new File(targetDir, filename);
 
-                if (destinationFile.exists()) {
+                // Check exact match AND base-name variants (aa.pdf / aa.pdf.cifrado /
+                // aa.pdf.assinado / aa.pdf.envelope cannot coexist for the same user)
+                if (fileConflictExists(targetDir, filename)) {
                     discardBytes(in, fileSize);
-                    out.writeObject("ERROR: o ficheiro '" + filename + "' já existe no servidor");
+                    out.writeObject("ERROR: o ficheiro '" + filename + "' (ou uma variante) já existe no servidor para o utilizador '" + targetUser + "'");
                     out.flush();
                     continue;
                 }
@@ -223,6 +225,22 @@ public class mySaudeServer {
                 }
                 out.flush();
             }
+        }
+
+        /** Returns true if filename (or any of its base-name variants) already exists. */
+        private boolean fileConflictExists(File userDir, String filename) {
+            String base = getBaseName(filename);
+            for (String variant : new String[]{base, base + ".cifrado", base + ".assinado", base + ".envelope"}) {
+                if (new File(userDir, variant).exists()) return true;
+            }
+            return false;
+        }
+
+        private String getBaseName(String filename) {
+            if (filename.endsWith(".cifrado"))  return filename.substring(0, filename.length() - ".cifrado".length());
+            if (filename.endsWith(".assinado")) return filename.substring(0, filename.length() - ".assinado".length());
+            if (filename.endsWith(".envelope")) return filename.substring(0, filename.length() - ".envelope".length());
+            return filename;
         }
 
         private void discardBytes(ObjectInputStream in, long bytesToSkip) throws IOException {
