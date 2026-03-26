@@ -1,0 +1,25 @@
+# Java build artifacts
+*.class
+
+# Keystores and certificates
+keystore.*
+*.cer
+
+# Local server storage used for tests
+server_storage/
+
+# Generated crypto artifacts
+*.cifrado
+*.envelope
+*.assinatura.*
+*.chave.*
+
+# Local test files / backups
+*_backup.txt
+abc.txt
+assinar1.txt
+assinar1.txt.assinado
+seguro1.txt
+teste.txt
+teste2.txt
+teste2_original_backup.txt

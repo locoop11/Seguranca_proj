@@ -134,47 +134,46 @@ public class mySaude {
             case "-ce":
                 if (target == null) { System.err.println("Error: -t <destinatario> is required for -ce"); System.exit(1); }
                 if (password == null) { System.err.println("Error: -p <password> is required for -ce"); System.exit(1); }
-                System.err.println("Command -ce not yet implemented.");
+                encryptAndSendFiles(serverHost, serverPort, username, password, files, target);
                 break;
 
             case "-rd":
                 if (password == null) { System.err.println("Error: -p <password> is required for -rd"); System.exit(1); }
-                System.err.println("Command -rd not yet implemented.");
+                receiveAndDecryptFiles(serverHost, serverPort, username, password, files);
                 break;
 
             case "-a":
                 if (password == null) { System.err.println("Error: -p <password> is required for -a"); System.exit(1); }
-                System.err.println("Command -a not yet implemented.");
+                signFiles(username, password, files);
                 break;
 
             case "-v":
-                if (target == null) { System.err.println("Error: -t <quem_assinou> is required for -v"); System.exit(1); }
                 if (password == null) { System.err.println("Error: -p <password> is required for -v"); System.exit(1); }
-                System.err.println("Command -v not yet implemented.");
+                verifyFiles(username, password, files);
                 break;
 
             case "-ae":
                 if (target == null) { System.err.println("Error: -t <destinatario> is required for -ae"); System.exit(1); }
                 if (password == null) { System.err.println("Error: -p <password> is required for -ae"); System.exit(1); }
-                System.err.println("Command -ae not yet implemented.");
+                signAndSendFiles(serverHost, serverPort, username, password, files, target);
                 break;
 
             case "-rv":
                 if (target == null) { System.err.println("Error: -t <quem_assinou> is required for -rv"); System.exit(1); }
                 if (password == null) { System.err.println("Error: -p <password> is required for -rv"); System.exit(1); }
-                System.err.println("Command -rv not yet implemented.");
+                receiveAndVerifyFiles(serverHost, serverPort, username, password, files, target);
                 break;
 
             case "-ace":
                 if (target == null) { System.err.println("Error: -t <destinatario> is required for -ace"); System.exit(1); }
                 if (password == null) { System.err.println("Error: -p <password> is required for -ace"); System.exit(1); }
-                System.err.println("Command -ace not yet implemented.");
+                signEncryptAndSendFiles(serverHost, serverPort, username, password, files, target);
                 break;
 
             case "-rdv":
                 if (target == null) { System.err.println("Error: -t <quem_assinou> is required for -rdv"); System.exit(1); }
                 if (password == null) { System.err.println("Error: -p <password> is required for -rdv"); System.exit(1); }
-                System.err.println("Command -rdv not yet implemented.");
+                receiveDecryptAndVerifyFiles(serverHost, serverPort, username, password, files, target);
                 break;
 
             default:
@@ -538,6 +537,441 @@ public class mySaude {
             }
         }
     }
+
+
+    static void encryptAndSendFiles(String host, int port,
+                                String username, String password,
+                                List<String> files, String target) {
+
+        // 1) Cifrar localmente
+        encryptFiles(username, password, files, target);
+
+        // 2) Preparar lista dos ficheiros gerados
+        List<String> generatedFiles = new ArrayList<>();
+
+        for (String filePath : files) {
+            String baseName = new File(filePath).getName();
+
+            File encryptedFile = new File(baseName + ".cifrado");
+            File keyFile = new File(baseName + ".chave." + target);
+
+            if (encryptedFile.exists() && encryptedFile.isFile() &&
+                keyFile.exists() && keyFile.isFile()) {
+                generatedFiles.add(encryptedFile.getPath());
+                generatedFiles.add(keyFile.getPath());
+            } else {
+                System.err.println("Error: encrypted output missing for '" + baseName + "'. Skipping send.");
+            }
+        }
+
+        if (generatedFiles.isEmpty()) {
+            System.out.println("No encrypted files to send.");
+            return;
+        }
+
+        // 3) Enviar para o servidor
+        sendFiles(host, port, username, generatedFiles, target);
+    }
+
+
+    static void receiveAndDecryptFiles(String host, int port,
+                                   String username, String password,
+                                   List<String> files) {
+
+        List<String> filesToReceive = new ArrayList<>();
+
+        for (String name : files) {
+            filesToReceive.add(name + ".cifrado");
+            filesToReceive.add(name + ".chave." + username);
+        }
+
+        // 1) Receber do servidor os ficheiros necessários
+        receiveFiles(host, port, username, filesToReceive);
+
+        // 2) Decifrar os .cifrado recebidos
+        List<String> encryptedFiles = new ArrayList<>();
+        for (String name : files) {
+            encryptedFiles.add(name + ".cifrado");
+        }
+
+        decryptFiles(username, password, encryptedFiles);
+    }
+
+
+    static void signFiles(String username, String password, List<String> files) {
+        try {
+            KeyStore ks = loadKeyStore(username, password);
+            PrivateKey privateKey = (PrivateKey) ks.getKey(username, password.toCharArray());
+
+            if (privateKey == null) {
+                System.err.println("Error: private key for user '" + username + "' not found in keystore.");
+                return;
+            }
+
+            for (String filePath : files) {
+                File inputFile = new File(filePath);
+
+                if (!inputFile.exists() || !inputFile.isFile()) {
+                    System.err.println("Error: file '" + filePath + "' does not exist. Skipping.");
+                    continue;
+                }
+
+                String signatureFileName = inputFile.getName() + ".assinatura." + username;
+                File signatureFile = new File(signatureFileName);
+
+                if (signatureFile.exists()) {
+                    System.err.println("Error: signature file '" + signatureFileName + "' already exists. Skipping.");
+                    continue;
+                }
+
+                Signature sig = Signature.getInstance("SHA256withRSA");
+                sig.initSign(privateKey);
+
+                try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(inputFile))) {
+                    byte[] buffer = new byte[4096];
+                    int n;
+                    while ((n = bis.read(buffer)) != -1) {
+                        sig.update(buffer, 0, n);
+                    }
+                }
+
+                byte[] signatureBytes = sig.sign();
+
+                try (FileOutputStream fos = new FileOutputStream(signatureFile)) {
+                    fos.write(signatureBytes);
+                }
+
+                System.out.println("Signed: " + inputFile.getName() + " -> " + signatureFileName);
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error signing files: " + e.getMessage());
+        }
+    }
+
+
+    static void verifyFiles(String username, String password, List<String> files) {
+        try {
+            KeyStore ks = loadKeyStore(username, password);
+
+            for (String filePath : files) {
+                File inputFile = new File(filePath);
+
+                if (!inputFile.exists() || !inputFile.isFile()) {
+                    System.err.println("Error: file '" + filePath + "' does not exist. Skipping.");
+                    continue;
+                }
+
+                String signer = findSignerForFile(inputFile.getName());
+                if (signer == null) {
+                    System.err.println("Error: no signature file found for '" + inputFile.getName() + "'.");
+                    continue;
+                }
+
+                String signatureFileName = inputFile.getName() + ".assinatura." + signer;
+                File signatureFile = new File(signatureFileName);
+
+                Certificate cert = ks.getCertificate(signer);
+                if (cert == null) {
+                    System.err.println("Error: certificate for signer '" + signer + "' not found in keystore.");
+                    continue;
+                }
+
+                PublicKey publicKey = cert.getPublicKey();
+
+                Signature sig = Signature.getInstance("SHA256withRSA");
+                sig.initVerify(publicKey);
+
+                try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(inputFile))) {
+                    byte[] buffer = new byte[4096];
+                    int n;
+                    while ((n = bis.read(buffer)) != -1) {
+                        sig.update(buffer, 0, n);
+                    }
+                }
+
+                byte[] signatureBytes = Files.readAllBytes(signatureFile.toPath());
+                boolean ok = sig.verify(signatureBytes);
+
+                if (ok) {
+                    System.out.println("Signature valid: " + inputFile.getName() + " (signed by " + signer + ")");
+                } else {
+                    System.out.println("Signature INVALID: " + inputFile.getName() + " (signed by " + signer + ")");
+                }
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error verifying files: " + e.getMessage());
+        }
+    }
+
+
+    static String findSignerForFile(String baseFileName) {
+        File dir = new File(".");
+        File[] matches = dir.listFiles((d, name) -> name.startsWith(baseFileName + ".assinatura."));
+
+        if (matches == null || matches.length == 0) return null;
+
+        String name = matches[0].getName();
+        String prefix = baseFileName + ".assinatura.";
+        return name.substring(prefix.length());
+}
+
+
+    static void signAndSendFiles(String host, int port,
+                             String username, String password,
+                             List<String> files, String target) {
+
+        signFiles(username, password, files);
+
+        List<String> generatedFiles = new ArrayList<>();
+
+        for (String filePath : files) {
+            File original = new File(filePath);
+            String baseName = original.getName();
+
+            File signedCopy = new File(baseName + ".assinado");
+            File signatureFile = new File(baseName + ".assinatura." + username);
+
+            try {
+                Files.copy(original.toPath(), signedCopy.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+            } catch (IOException e) {
+                System.err.println("Error creating signed copy for '" + baseName + "': " + e.getMessage());
+                continue;
+            }
+
+            if (signedCopy.exists() && signatureFile.exists()) {
+                generatedFiles.add(signedCopy.getPath());
+                generatedFiles.add(signatureFile.getPath());
+            } else {
+                System.err.println("Error: missing signed output for '" + baseName + "'.");
+            }
+        }
+
+        if (generatedFiles.isEmpty()) {
+            System.out.println("No signed files to send.");
+            return;
+        }
+
+        sendFiles(host, port, username, generatedFiles, target);
+    }
+
+
+    static void receiveAndVerifyFiles(String host, int port,
+                                  String username, String password,
+                                  List<String> files, String signer) {
+
+        List<String> filesToReceive = new ArrayList<>();
+
+        for (String name : files) {
+            filesToReceive.add(name + ".assinado");
+            filesToReceive.add(name + ".assinatura." + signer);
+        }
+
+        receiveFiles(host, port, username, filesToReceive);
+
+        for (String name : files) {
+            File signedFile = new File(name + ".assinado");
+            File restoredFile = new File(name);
+
+            if (signedFile.exists()) {
+                try {
+                    Files.copy(signedFile.toPath(), restoredFile.toPath(), java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException e) {
+                    System.err.println("Error restoring signed file '" + name + "': " + e.getMessage());
+                    continue;
+                }
+            }
+        }
+
+        verifyFiles(username, password, files);
+    }
+
+
+
+    static void signEncryptAndSendFiles(String host, int port,
+                                    String username, String password,
+                                    List<String> files, String target) {
+
+        try {
+            KeyStore ks = loadKeyStore(username, password);
+            PrivateKey privateKey = (PrivateKey) ks.getKey(username, password.toCharArray());
+
+            if (privateKey == null) {
+                System.err.println("Error: private key for user '" + username + "' not found.");
+                return;
+            }
+
+            Certificate cert = ks.getCertificate(target);
+            if (cert == null) {
+                System.err.println("Error: certificate for target '" + target + "' not found in keystore.");
+                return;
+            }
+
+            PublicKey recipientPublicKey = cert.getPublicKey();
+
+            List<String> generatedFiles = new ArrayList<>();
+
+            for (String filePath : files) {
+                File inputFile = new File(filePath);
+
+                if (!inputFile.exists() || !inputFile.isFile()) {
+                    System.err.println("Error: file '" + filePath + "' does not exist. Skipping.");
+                    continue;
+                }
+
+                String baseName = inputFile.getName();
+
+                File envelopeFile = new File(baseName + ".envelope");
+                File signatureFile = new File(baseName + ".assinatura." + username);
+                File keyFile = new File(baseName + ".chave." + target);
+
+                if (envelopeFile.exists() || signatureFile.exists() || keyFile.exists()) {
+                    System.err.println("Error: output file(s) already exist for '" + baseName + "'. Skipping.");
+                    continue;
+                }
+
+                Signature sig = Signature.getInstance("SHA256withRSA");
+                sig.initSign(privateKey);
+
+                try (BufferedInputStream bis = new BufferedInputStream(new FileInputStream(inputFile))) {
+                    byte[] buffer = new byte[4096];
+                    int n;
+                    while ((n = bis.read(buffer)) != -1) {
+                        sig.update(buffer, 0, n);
+                    }
+                }
+
+                byte[] signatureBytes = sig.sign();
+
+                try (FileOutputStream fos = new FileOutputStream(signatureFile)) {
+                    fos.write(signatureBytes);
+                }
+
+                KeyGenerator kg = KeyGenerator.getInstance("AES");
+                kg.init(128);
+                SecretKey aesKey = kg.generateKey();
+
+                Cipher aesCipher = Cipher.getInstance("AES");
+                aesCipher.init(Cipher.ENCRYPT_MODE, aesKey);
+
+                try (FileInputStream fis = new FileInputStream(inputFile);
+                    FileOutputStream fos = new FileOutputStream(envelopeFile);
+                    CipherOutputStream cos = new CipherOutputStream(fos, aesCipher)) {
+
+                    byte[] buffer = new byte[4096];
+                    int n;
+                    while ((n = fis.read(buffer)) != -1) {
+                        cos.write(buffer, 0, n);
+                    }
+                }
+
+                Cipher rsaCipher = Cipher.getInstance("RSA");
+                rsaCipher.init(Cipher.ENCRYPT_MODE, recipientPublicKey);
+                byte[] encryptedAesKey = rsaCipher.doFinal(aesKey.getEncoded());
+
+                try (FileOutputStream fos = new FileOutputStream(keyFile)) {
+                    fos.write(encryptedAesKey);
+                }
+
+                generatedFiles.add(envelopeFile.getPath());
+                generatedFiles.add(signatureFile.getPath());
+                generatedFiles.add(keyFile.getPath());
+
+                System.out.println("Signed+Encrypted: " + baseName + " -> "
+                        + envelopeFile.getName() + " + "
+                        + signatureFile.getName() + " + "
+                        + keyFile.getName());
+            }
+
+            if (generatedFiles.isEmpty()) {
+                System.out.println("No envelope files to send.");
+                return;
+            }
+
+            sendFiles(host, port, username, generatedFiles, target);
+
+        } catch (Exception e) {
+            System.err.println("Error in -ace: " + e.getMessage());
+        }
+    }
+
+
+    static void receiveDecryptAndVerifyFiles(String host, int port,
+                                         String username, String password,
+                                         List<String> files, String signer) {
+
+        List<String> filesToReceive = new ArrayList<>();
+
+        for (String name : files) {
+            filesToReceive.add(name + ".envelope");
+            filesToReceive.add(name + ".assinatura." + signer);
+            filesToReceive.add(name + ".chave." + username);
+        }
+
+        // 1) Receber os ficheiros do servidor
+        receiveFiles(host, port, username, filesToReceive);
+
+        // 2) Decifrar os envelopes recebidos
+        try {
+            KeyStore ks = loadKeyStore(username, password);
+            PrivateKey privateKey = (PrivateKey) ks.getKey(username, password.toCharArray());
+
+            if (privateKey == null) {
+                System.err.println("Error: private key for user '" + username + "' not found.");
+                return;
+            }
+
+            for (String name : files) {
+                File envelopeFile = new File(name + ".envelope");
+                File keyFile = new File(name + ".chave." + username);
+                File outputFile = new File(name);
+
+                if (!envelopeFile.exists() || !keyFile.exists()) {
+                    System.err.println("Error: missing envelope/key for '" + name + "'. Skipping.");
+                    continue;
+                }
+
+                if (outputFile.exists()) {
+                    System.err.println("Error: output file '" + name + "' already exists. Skipping decrypt.");
+                    continue;
+                }
+
+                byte[] encryptedAesKey = Files.readAllBytes(keyFile.toPath());
+
+                Cipher rsaCipher = Cipher.getInstance("RSA");
+                rsaCipher.init(Cipher.DECRYPT_MODE, privateKey);
+                byte[] aesKeyBytes = rsaCipher.doFinal(encryptedAesKey);
+
+                SecretKey aesKey = new SecretKeySpec(aesKeyBytes, "AES");
+
+                Cipher aesCipher = Cipher.getInstance("AES");
+                aesCipher.init(Cipher.DECRYPT_MODE, aesKey);
+
+                try (FileInputStream fis = new FileInputStream(envelopeFile);
+                    CipherInputStream cis = new CipherInputStream(fis, aesCipher);
+                    FileOutputStream fos = new FileOutputStream(outputFile)) {
+
+                    byte[] buffer = new byte[4096];
+                    int n;
+                    while ((n = cis.read(buffer)) != -1) {
+                        fos.write(buffer, 0, n);
+                    }
+                }
+
+                System.out.println("Decrypted: " + name);
+            }
+
+        } catch (Exception e) {
+            System.err.println("Error decrypting in -rdv: " + e.getMessage());
+            return;
+        }
+
+        // 3) Verificar assinatura do ficheiro decifrado
+        verifyFiles(username, password, files);
+    }
+
+
 
     // -------------------------------------------------------------------------
     // Keystore loader — shared by -c, -d, -a, -v
