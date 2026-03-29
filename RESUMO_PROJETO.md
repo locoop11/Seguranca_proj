@@ -8,10 +8,9 @@ na concretização de um sistema simplificado de armazenamento de ficheiros, des
 os utilizadores usam um servidor central para armazenar ficheiros de utentes (resultados de exames,
 declarações, prescrições, etc).
 2 Arquitectura do Sistema
-O trabalho consiste no desenvolvimento de três programas:
+O trabalho consiste no desenvolvimento de dois programas:
 • O servidor mySaudeServer,
-• A aplicação cliente mySaude que acede ao servidor via sockets TCP, e
-• criarUser
+• A aplicação cliente mySaude que acede ao servidor via sockets TCP.
 A aplicação é distribuída de forma que o servidor fica numa máquina e o utilizador pode usar clientes em
 máquinas diferentes na Internet.
 3 Funcionalidades

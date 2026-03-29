@@ -149,7 +149,8 @@ public class mySaude {
 
             case "-v":
                 if (password == null) { System.err.println("Error: -p <password> is required for -v"); System.exit(1); }
-                verifyFiles(username, password, files);
+                if (target == null) { System.err.println("Error: -t <quem_assinou> is required for -v"); System.exit(1); }
+                verifyFiles(username, password, files, target);
                 break;
 
             case "-ae":
@@ -650,35 +651,42 @@ public class mySaude {
     }
 
 
-    static void verifyFiles(String username, String password, List<String> files) {
+    static void verifyFiles(String username, String password, List<String> files, String signer) {
+        KeyStore ks = loadKeyStore(username, password);
+        if (ks == null) return;
+
+        Certificate cert;
         try {
-            KeyStore ks = loadKeyStore(username, password);
+            cert = ks.getCertificate(signer);
+        } catch (KeyStoreException e) {
+            System.err.println("Error accessing keystore: " + e.getMessage());
+            return;
+        }
+        if (cert == null) {
+            System.err.println("Error: certificate for signer '" + signer + "' not found in keystore." +
+                " Import it first: keytool -importcert -alias " + signer +
+                " -keystore keystore." + username + " -file " + signer + ".cer");
+            return;
+        }
+        PublicKey publicKey = cert.getPublicKey();
 
-            for (String filePath : files) {
-                File inputFile = new File(filePath);
+        for (String filePath : files) {
+            File inputFile = new File(filePath);
 
-                if (!inputFile.exists() || !inputFile.isFile()) {
-                    System.err.println("Error: file '" + filePath + "' does not exist. Skipping.");
-                    continue;
-                }
+            if (!inputFile.exists() || !inputFile.isFile()) {
+                System.err.println("Error: file '" + filePath + "' does not exist. Skipping.");
+                continue;
+            }
 
-                String signer = findSignerForFile(inputFile.getName());
-                if (signer == null) {
-                    System.err.println("Error: no signature file found for '" + inputFile.getName() + "'.");
-                    continue;
-                }
+            String signatureFileName = inputFile.getName() + ".assinatura." + signer;
+            File signatureFile = new File(signatureFileName);
 
-                String signatureFileName = inputFile.getName() + ".assinatura." + signer;
-                File signatureFile = new File(signatureFileName);
+            if (!signatureFile.exists()) {
+                System.err.println("Error: signature file '" + signatureFileName + "' not found.");
+                continue;
+            }
 
-                Certificate cert = ks.getCertificate(signer);
-                if (cert == null) {
-                    System.err.println("Error: certificate for signer '" + signer + "' not found in keystore.");
-                    continue;
-                }
-
-                PublicKey publicKey = cert.getPublicKey();
-
+            try {
                 Signature sig = Signature.getInstance("SHA256withRSA");
                 sig.initVerify(publicKey);
 
@@ -698,24 +706,11 @@ public class mySaude {
                 } else {
                     System.out.println("Signature INVALID: " + inputFile.getName() + " (signed by " + signer + ")");
                 }
+            } catch (Exception e) {
+                System.err.println("Error verifying '" + filePath + "': " + e.getMessage());
             }
-
-        } catch (Exception e) {
-            System.err.println("Error verifying files: " + e.getMessage());
         }
     }
-
-
-    static String findSignerForFile(String baseFileName) {
-        File dir = new File(".");
-        File[] matches = dir.listFiles((d, name) -> name.startsWith(baseFileName + ".assinatura."));
-
-        if (matches == null || matches.length == 0) return null;
-
-        String name = matches[0].getName();
-        String prefix = baseFileName + ".assinatura.";
-        return name.substring(prefix.length());
-}
 
 
     static void signAndSendFiles(String host, int port,
@@ -784,7 +779,7 @@ public class mySaude {
             }
         }
 
-        verifyFiles(username, password, files);
+        verifyFiles(username, password, files, signer);
     }
 
 
@@ -852,21 +847,27 @@ public class mySaude {
                 kg.init(128);
                 SecretKey aesKey = kg.generateKey();
 
-                Cipher aesCipher = Cipher.getInstance("AES");
-                aesCipher.init(Cipher.ENCRYPT_MODE, aesKey);
+                byte[] iv = new byte[16];
+                new SecureRandom().nextBytes(iv);
+                IvParameterSpec ivSpec = new IvParameterSpec(iv);
+
+                Cipher aesCipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                aesCipher.init(Cipher.ENCRYPT_MODE, aesKey, ivSpec);
 
                 try (FileInputStream fis = new FileInputStream(inputFile);
-                    FileOutputStream fos = new FileOutputStream(envelopeFile);
-                    CipherOutputStream cos = new CipherOutputStream(fos, aesCipher)) {
-
+                     FileOutputStream fos = new FileOutputStream(envelopeFile)) {
+                    fos.write(iv); // prepend IV
                     byte[] buffer = new byte[4096];
                     int n;
                     while ((n = fis.read(buffer)) != -1) {
-                        cos.write(buffer, 0, n);
+                        byte[] block = aesCipher.update(buffer, 0, n);
+                        if (block != null) fos.write(block);
                     }
+                    byte[] last = aesCipher.doFinal();
+                    if (last != null) fos.write(last);
                 }
 
-                Cipher rsaCipher = Cipher.getInstance("RSA");
+                Cipher rsaCipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
                 rsaCipher.init(Cipher.ENCRYPT_MODE, recipientPublicKey);
                 byte[] encryptedAesKey = rsaCipher.doFinal(aesKey.getEncoded());
 
@@ -939,24 +940,32 @@ public class mySaude {
 
                 byte[] encryptedAesKey = Files.readAllBytes(keyFile.toPath());
 
-                Cipher rsaCipher = Cipher.getInstance("RSA");
+                Cipher rsaCipher = Cipher.getInstance("RSA/ECB/PKCS1Padding");
                 rsaCipher.init(Cipher.DECRYPT_MODE, privateKey);
                 byte[] aesKeyBytes = rsaCipher.doFinal(encryptedAesKey);
 
                 SecretKey aesKey = new SecretKeySpec(aesKeyBytes, "AES");
 
-                Cipher aesCipher = Cipher.getInstance("AES");
-                aesCipher.init(Cipher.DECRYPT_MODE, aesKey);
-
                 try (FileInputStream fis = new FileInputStream(envelopeFile);
-                    CipherInputStream cis = new CipherInputStream(fis, aesCipher);
-                    FileOutputStream fos = new FileOutputStream(outputFile)) {
+                     FileOutputStream fos = new FileOutputStream(outputFile)) {
+
+                    byte[] iv = new byte[16];
+                    if (fis.read(iv) != 16) {
+                        throw new IOException("Envelope file invalid: could not read IV.");
+                    }
+                    IvParameterSpec ivSpec = new IvParameterSpec(iv);
+
+                    Cipher aesCipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
+                    aesCipher.init(Cipher.DECRYPT_MODE, aesKey, ivSpec);
 
                     byte[] buffer = new byte[4096];
                     int n;
-                    while ((n = cis.read(buffer)) != -1) {
-                        fos.write(buffer, 0, n);
+                    while ((n = fis.read(buffer)) != -1) {
+                        byte[] block = aesCipher.update(buffer, 0, n);
+                        if (block != null) fos.write(block);
                     }
+                    byte[] last = aesCipher.doFinal();
+                    if (last != null) fos.write(last);
                 }
 
                 System.out.println("Decrypted: " + name);
@@ -968,7 +977,7 @@ public class mySaude {
         }
 
         // 3) Verificar assinatura do ficheiro decifrado
-        verifyFiles(username, password, files);
+        verifyFiles(username, password, files, signer);
     }
 
 
