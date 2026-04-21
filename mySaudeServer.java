@@ -8,10 +8,16 @@ import java.io.EOFException;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.FileReader;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.nio.charset.StandardCharsets;
+import java.security.MessageDigest;
 import java.security.KeyStore;
+import java.security.SecureRandom;
+import java.util.Base64;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLServerSocket;
@@ -21,6 +27,7 @@ import java.net.Socket;
 public class mySaudeServer {
 
     private static final String STORAGE_DIR = "server_storage";
+    private static final String USERS_FILE = "users";
     private static final int BUFFER_SIZE = 4096;
 
 
@@ -48,6 +55,7 @@ public class mySaudeServer {
 
     public void startServer(int port) {
         createBaseStorage();
+        ensureUsersFileExists();
         SSLServerSocket sslServerSocket = null;
 
         try {
@@ -90,6 +98,129 @@ public class mySaudeServer {
         if (!baseDir.exists() && !baseDir.mkdirs()) {
             System.err.println("Aviso: não foi possível criar a pasta base " + STORAGE_DIR);
         }
+    }
+
+    private void ensureUsersFileExists() {
+        File usersFile = new File(USERS_FILE);
+        if (usersFile.exists()) {
+            return;
+        }
+        try {
+            if (!usersFile.createNewFile()) {
+                System.err.println("Aviso: não foi possível criar o ficheiro '" + USERS_FILE + "'.");
+            }
+        } catch (IOException e) {
+            System.err.println("Aviso: erro ao criar o ficheiro '" + USERS_FILE + "': " + e.getMessage());
+        }
+    }
+
+    static class UserRecord {
+        final String username;
+        final String role;
+        final byte[] salt;
+        final byte[] passwordHash;
+
+        UserRecord(String username, String role, byte[] salt, byte[] passwordHash) {
+            this.username = username;
+            this.role = role;
+            this.salt = salt;
+            this.passwordHash = passwordHash;
+        }
+    }
+
+    static boolean isValidRole(String role) {
+        return "medico".equals(role) || "utente".equals(role);
+    }
+
+    static byte[] generateSalt() {
+        byte[] salt = new byte[16];
+        new SecureRandom().nextBytes(salt);
+        return salt;
+    }
+
+    static byte[] hashPasswordWithSalt(byte[] salt, String password) throws Exception {
+        MessageDigest digest = MessageDigest.getInstance("SHA-256");
+        digest.update(salt);
+        digest.update(password.getBytes(StandardCharsets.UTF_8));
+        return digest.digest();
+    }
+
+    static String encodeBase64(byte[] bytes) {
+        return Base64.getEncoder().encodeToString(bytes);
+    }
+
+    static byte[] decodeBase64(String encoded) {
+        return Base64.getDecoder().decode(encoded);
+    }
+
+    static String formatUserLine(String username, String role, byte[] salt, byte[] hash) {
+        return username + ":" + role + ":" + encodeBase64(salt) + ":" + encodeBase64(hash);
+    }
+
+    static UserRecord parseUserLine(String line) {
+        String[] parts = line.split(":");
+        if (parts.length != 4) {
+            throw new IllegalArgumentException("Linha de utilizador inválida no ficheiro users.");
+        }
+        String username = parts[0];
+        String role = parts[1];
+        if (!isValidRole(role)) {
+            throw new IllegalArgumentException("Função inválida para o utilizador '" + username + "'.");
+        }
+        byte[] salt = decodeBase64(parts[2]);
+        byte[] hash = decodeBase64(parts[3]);
+        return new UserRecord(username, role, salt, hash);
+    }
+
+    static UserRecord findUserByUsername(String username) throws Exception {
+        File usersFile = new File(USERS_FILE);
+        if (!usersFile.exists()) {
+            return null;
+        }
+
+        try (FileReader fr = new FileReader(usersFile, StandardCharsets.UTF_8);
+             java.io.BufferedReader br = new java.io.BufferedReader(fr)) {
+            String line;
+            while ((line = br.readLine()) != null) {
+                line = line.trim();
+                if (line.isEmpty()) {
+                    continue;
+                }
+                UserRecord user = parseUserLine(line);
+                if (username.equals(user.username)) {
+                    return user; // terminate immediately once the user is found
+                }
+            }
+        }
+        return null;
+    }
+
+    static boolean authenticateUser(String username, String password) throws Exception {
+        UserRecord user = findUserByUsername(username);
+        if (user == null) {
+            return false;
+        }
+        byte[] computedHash = hashPasswordWithSalt(user.salt, password);
+        return MessageDigest.isEqual(user.passwordHash, computedHash);
+    }
+
+    static boolean addUser(String username, String role, String password) throws Exception {
+        if (!isValidRole(role)) {
+            throw new IllegalArgumentException("Função inválida. Use 'medico' ou 'utente'.");
+        }
+        if (findUserByUsername(username) != null) {
+            return false;
+        }
+
+        byte[] salt = generateSalt();
+        byte[] hash = hashPasswordWithSalt(salt, password);
+        String userLine = formatUserLine(username, role, salt, hash);
+
+        try (FileWriter writer = new FileWriter(USERS_FILE, StandardCharsets.UTF_8, true)) {
+            writer.write(userLine);
+            writer.write(System.lineSeparator());
+        }
+        return true;
     }
 
     class ServerThread extends Thread {
