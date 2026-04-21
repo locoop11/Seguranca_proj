@@ -4,6 +4,10 @@ import java.nio.file.Files;
 import java.security.*;
 import java.security.cert.Certificate;
 import java.util.*;
+import javax.net.ssl.SSLException;
+import javax.net.ssl.SSLHandshakeException;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 import javax.crypto.*;
 import javax.crypto.spec.*;
 
@@ -217,7 +221,7 @@ public class mySaude {
             return;
         }
 
-        try (Socket socket = new Socket(host, port)) {
+        try (SSLSocket socket = createTlsSocket(host, port)) {
             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
             out.flush();
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
@@ -257,6 +261,10 @@ public class mySaude {
 
         } catch (ConnectException e) {
             System.err.println("Error: cannot connect to server at " + host + ":" + port);
+        } catch (SSLHandshakeException e) {
+            System.err.println("TLS handshake failed (server certificate is not trusted/valid): " + e.getMessage());
+        } catch (SSLException e) {
+            System.err.println("TLS error while communicating with server: " + e.getMessage());
         } catch (IOException | ClassNotFoundException e) {
             System.err.println("Error communicating with server: " + e.getMessage());
         }
@@ -298,7 +306,7 @@ public class mySaude {
             return;
         }
 
-        try (Socket socket = new Socket(host, port)) {
+        try (SSLSocket socket = createTlsSocket(host, port)) {
             ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
             out.flush();
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
@@ -342,6 +350,10 @@ public class mySaude {
 
         } catch (ConnectException e) {
             System.err.println("Error: cannot connect to server at " + host + ":" + port);
+        } catch (SSLHandshakeException e) {
+            System.err.println("TLS handshake failed (server certificate is not trusted/valid): " + e.getMessage());
+        } catch (SSLException e) {
+            System.err.println("TLS error while communicating with server: " + e.getMessage());
         } catch (IOException | ClassNotFoundException e) {
             System.err.println("Error communicating with server: " + e.getMessage());
         }
@@ -1021,6 +1033,13 @@ public class mySaude {
             default:
                 return false;
         }
+    }
+
+    private static SSLSocket createTlsSocket(String host, int port) throws IOException {
+        SSLSocketFactory factory = (SSLSocketFactory) SSLSocketFactory.getDefault();
+        SSLSocket socket = (SSLSocket) factory.createSocket(host, port);
+        socket.startHandshake();
+        return socket;
     }
 
     private static void printUsage() {

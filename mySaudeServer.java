@@ -11,7 +11,11 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
-import java.net.ServerSocket;
+import java.security.KeyStore;
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLServerSocketFactory;
 import java.net.Socket;
 
 public class mySaudeServer {
@@ -19,7 +23,6 @@ public class mySaudeServer {
     private static final String STORAGE_DIR = "server_storage";
     private static final int BUFFER_SIZE = 4096;
 
-    private ServerSocket serverSocket = null;
 
     public static void main(String[] args) {
         if (args.length != 1) {
@@ -45,21 +48,37 @@ public class mySaudeServer {
 
     public void startServer(int port) {
         createBaseStorage();
+        SSLServerSocket sslServerSocket = null;
 
         try {
-            serverSocket = new ServerSocket(port);
+            String ksPath = "keystore.server";
+            char[] ksPassword = "changeit".toCharArray();
+
+            KeyStore ks = KeyStore.getInstance("PKCS12");
+            try (FileInputStream fis = new FileInputStream(ksPath)) {
+                ks.load(fis, ksPassword);
+            }
+
+            KeyManagerFactory kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm());                         
+            kmf.init(ks, ksPassword);
+
+            SSLContext sslContext = SSLContext.getInstance("TLS");                  //context
+            sslContext.init(kmf.getKeyManagers(), null, null);
+
+            SSLServerSocketFactory ssf = sslContext.getServerSocketFactory();            // fábrica de sockets SSL com a keystore carregada
+            sslServerSocket = (SSLServerSocket) ssf.createServerSocket(port);           //usar a Fabrica para criar o ojeto socket SSL
             System.out.println("Servidor à escuta no porto " + port);
 
             while (true) {
-                Socket clientSocket = serverSocket.accept();
+                Socket clientSocket = sslServerSocket.accept();
                 new ServerThread(clientSocket).start();
             }
-        } catch (IOException e) {
+        } catch (Exception e) {
             System.err.println("Erro no servidor: " + e.getMessage());
         } finally {
-            if (serverSocket != null && !serverSocket.isClosed()) {
+            if (sslServerSocket != null && !sslServerSocket.isClosed()) {
                 try {
-                    serverSocket.close();
+                    sslServerSocket.close();
                 } catch (IOException ignored) {
                 }
             }
