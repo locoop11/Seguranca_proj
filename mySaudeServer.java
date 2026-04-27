@@ -13,11 +13,19 @@ import java.io.FileWriter;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.io.InputStreamReader;
+import java.io.BufferedReader;
+import java.io.Console;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.KeyStore;
 import java.security.SecureRandom;
 import java.util.Base64;
+import javax.crypto.Mac;
+import javax.crypto.SecretKey;
+import javax.crypto.spec.SecretKeySpec;
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLServerSocket;
@@ -28,7 +36,9 @@ public class mySaudeServer {
 
     private static final String STORAGE_DIR = "server_storage";
     private static final String USERS_FILE = "users";
+    private static final String MAC_FILE = "mySaude.mac";
     private static final int BUFFER_SIZE = 4096;
+    private static SecretKey usersMacKey;
 
 
     public static void main(String[] args) {
@@ -56,6 +66,9 @@ public class mySaudeServer {
     public void startServer(int port) {
         createBaseStorage();
         ensureUsersFileExists();
+        if (!initializeUsersMacProtection()) {
+            return;
+        }
         SSLServerSocket sslServerSocket = null;
 
         try {
@@ -111,6 +124,55 @@ public class mySaudeServer {
             }
         } catch (IOException e) {
             System.err.println("Aviso: erro ao criar o ficheiro '" + USERS_FILE + "': " + e.getMessage());
+        }
+    }
+
+    private boolean initializeUsersMacProtection() {
+        String macPassword = readMacPasswordFromConsole();
+        if (macPassword == null || macPassword.isEmpty()) {
+            System.err.println("Erro: password MAC vazia.");
+            return false;
+        }
+        usersMacKey = new SecretKeySpec(macPassword.getBytes(StandardCharsets.UTF_8), "HmacSHA256");
+
+        try {
+            File macFile = new File(MAC_FILE);
+            byte[] currentMac = computeUsersMac(usersMacKey);
+
+            if (!macFile.exists()) {
+                if (new File(USERS_FILE).length() == 0) {
+                    writeMacToFile(currentMac);
+                    System.out.println("MAC inicial criado em '" + MAC_FILE + "'.");
+                    return true;
+                }
+                System.err.println("Erro: ficheiro MAC '" + MAC_FILE + "' não existe.");
+                return false;
+            }
+
+            byte[] storedMac = readMacFromFile();
+            if (!MessageDigest.isEqual(storedMac, currentMac)) {
+                System.err.println("Erro: integridade do ficheiro '" + USERS_FILE + "' comprometida (MAC inválido).");
+                return false;
+            }
+            return true;
+        } catch (Exception e) {
+            System.err.println("Erro ao validar MAC de utilizadores: " + e.getMessage());
+            return false;
+        }
+    }
+
+    private String readMacPasswordFromConsole() {
+        Console console = System.console();
+        if (console != null) {
+            char[] chars = console.readPassword("Introduza a password MAC do servidor: ");
+            return chars == null ? null : new String(chars);
+        }
+        System.out.print("Introduza a password MAC do servidor: ");
+        BufferedReader br = new BufferedReader(new InputStreamReader(System.in, StandardCharsets.UTF_8));
+        try {
+            return br.readLine();
+        } catch (IOException e) {
+            return null;
         }
     }
 
@@ -173,6 +235,7 @@ public class mySaudeServer {
     }
 
     static UserRecord findUserByUsername(String username) throws Exception {
+        verifyUsersMacBeforeAccess();
         File usersFile = new File(USERS_FILE);
         if (!usersFile.exists()) {
             return null;
@@ -205,6 +268,7 @@ public class mySaudeServer {
     }
 
     static boolean addUser(String username, String role, String password) throws Exception {
+        verifyUsersMacBeforeAccess();
         if (!isValidRole(role)) {
             throw new IllegalArgumentException("Função inválida. Use 'medico' ou 'utente'.");
         }
@@ -220,7 +284,53 @@ public class mySaudeServer {
             writer.write(userLine);
             writer.write(System.lineSeparator());
         }
+        updateUsersMacAfterChange();
         return true;
+    }
+
+    static void verifyUsersMacBeforeAccess() throws Exception {
+        if (usersMacKey == null) {
+            throw new IllegalStateException("Chave MAC não inicializada.");
+        }
+
+        File macFile = new File(MAC_FILE);
+        if (!macFile.exists()) {
+            throw new SecurityException("Ficheiro MAC '" + MAC_FILE + "' não existe.");
+        }
+
+        byte[] expectedMac = readMacFromFile();
+        byte[] currentMac = computeUsersMac(usersMacKey);
+        if (!MessageDigest.isEqual(expectedMac, currentMac)) {
+            throw new SecurityException("MAC inválido para o ficheiro '" + USERS_FILE + "'.");
+        }
+    }
+
+    static void updateUsersMacAfterChange() throws Exception {
+        if (usersMacKey == null) {
+            throw new IllegalStateException("Chave MAC não inicializada.");
+        }
+        byte[] updatedMac = computeUsersMac(usersMacKey);
+        writeMacToFile(updatedMac);
+    }
+
+    static byte[] computeUsersMac(SecretKey key) throws Exception {
+        Mac mac = Mac.getInstance("HmacSHA256");
+        mac.init(key);
+        byte[] usersBytes = Files.readAllBytes(Path.of(USERS_FILE));
+        return mac.doFinal(usersBytes);
+    }
+
+    static void writeMacToFile(byte[] macBytes) throws IOException {
+        String encoded = Base64.getEncoder().encodeToString(macBytes);
+        Files.writeString(Path.of(MAC_FILE), encoded, StandardCharsets.UTF_8);
+    }
+
+    static byte[] readMacFromFile() throws IOException {
+        String content = Files.readString(Path.of(MAC_FILE), StandardCharsets.UTF_8).trim();
+        if (content.isEmpty()) {
+            throw new IOException("Ficheiro MAC vazio.");
+        }
+        return Base64.getDecoder().decode(content);
     }
 
     class ServerThread extends Thread {
