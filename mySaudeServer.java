@@ -1,7 +1,7 @@
 /***************************************************************************
 *   Seguranca Informatica
-*   mySaudeServer - versão base para TP1
-*   Suporta operações SEND e RECEIVE sem autenticação
+*   mySaudeServer - Trabalho 2
+*   Suporta SEND, RECEIVE e GET_CERT com TLS, autenticação e controlo de acesso
 ***************************************************************************/
 
 import java.io.EOFException;
@@ -22,6 +22,7 @@ import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.KeyStore;
 import java.security.SecureRandom;
+import java.security.cert.Certificate;
 import java.util.Base64;
 import javax.crypto.Mac;
 import javax.crypto.SecretKey;
@@ -37,6 +38,8 @@ public class mySaudeServer {
     private static final String STORAGE_DIR = "server_storage";
     private static final String USERS_FILE = "users";
     private static final String MAC_FILE = "mySaude.mac";
+    private static final String USERS_KEYSTORE = "keystore.users";
+    private static final char[] USERS_KEYSTORE_PASSWORD = "changeit".toCharArray();
     private static final int BUFFER_SIZE = 4096;
     private static SecretKey usersMacKey;
 
@@ -357,6 +360,8 @@ public class mySaudeServer {
                     handleSend(in, out);
                 } else if ("RECEIVE".equals(command)) {
                     handleReceive(in, out);
+                } else if ("GET_CERT".equals(command)) {
+                    handleGetCertificate(in, out);
                 } else {
                     out.writeObject("ERROR: comando inválido");
                     out.flush();
@@ -390,10 +395,23 @@ public class mySaudeServer {
 
         private void handleSend(ObjectInputStream in, ObjectOutputStream out) throws Exception {
             String senderUser = (String) in.readObject();
+            String password = (String) in.readObject();
             String targetUser = (String) in.readObject();
             int fileCount = in.readInt();
 
             System.out.println("Pedido SEND de '" + senderUser + "' para '" + targetUser + "' com " + fileCount + " ficheiro(s)");
+
+            UserRecord sender = findUserByUsername(senderUser);
+            if (sender == null || !passwordMatches(sender, password)) {
+                discardSendRequestWithError(in, out, fileCount, "ERROR: autenticação falhou");
+                return;
+            }
+
+            // Trabalho 2: apenas utilizadores com função medico podem enviar ficheiros.
+            if (!"medico".equals(sender.role)) {
+                discardSendRequestWithError(in, out, fileCount, "ERROR: apenas médicos podem enviar ficheiros");
+                return;
+            }
 
             File targetDir = new File(STORAGE_DIR, targetUser);
             if (!targetDir.exists() || !targetDir.isDirectory()) {
@@ -446,9 +464,22 @@ public class mySaudeServer {
 
         private void handleReceive(ObjectInputStream in, ObjectOutputStream out) throws Exception {
             String user = (String) in.readObject();
+            String password = (String) in.readObject();
             int fileCount = in.readInt();
 
             System.out.println("Pedido RECEIVE do utilizador '" + user + "' com " + fileCount + " ficheiro(s)");
+
+            UserRecord userRecord = findUserByUsername(user);
+            if (userRecord == null || !passwordMatches(userRecord, password)) {
+                for (int i = 0; i < fileCount; i++) {
+                    String filename = (String) in.readObject();
+                    out.writeObject("ERROR");
+                    out.writeObject(filename);
+                    out.writeObject("autenticação falhou");
+                    out.flush();
+                }
+                return;
+            }
 
             File userDir = new File(STORAGE_DIR, user);
 
@@ -483,6 +514,66 @@ public class mySaudeServer {
                         out.write(buffer, 0, bytesRead);
                     }
                 }
+                out.flush();
+            }
+        }
+
+        private void handleGetCertificate(ObjectInputStream in, ObjectOutputStream out) throws Exception {
+            String username = (String) in.readObject();
+            String password = (String) in.readObject();
+            String requestedUser = (String) in.readObject();
+
+            System.out.println("Pedido GET_CERT de '" + username + "' para certificado de '" + requestedUser + "'");
+
+            UserRecord userRecord = findUserByUsername(username);
+            if (userRecord == null || !passwordMatches(userRecord, password)) {
+                out.writeObject("ERROR");
+                out.writeObject("autenticação falhou");
+                out.flush();
+                return;
+            }
+
+            Certificate cert = getUserCertificate(requestedUser);
+            if (cert == null) {
+                out.writeObject("ERROR");
+                out.writeObject("certificado do utilizador '" + requestedUser + "' não existe na keystore.users");
+                out.flush();
+                return;
+            }
+
+            out.writeObject("OK");
+            out.writeObject(cert.getEncoded());
+            out.flush();
+        }
+
+        private Certificate getUserCertificate(String alias) throws Exception {
+            File ksFile = new File(USERS_KEYSTORE);
+            if (!ksFile.exists() || !ksFile.isFile()) {
+                throw new IOException("Keystore de utilizadores não existe: " + USERS_KEYSTORE);
+            }
+
+            KeyStore ks = KeyStore.getInstance("PKCS12");
+            try (FileInputStream fis = new FileInputStream(ksFile)) {
+                ks.load(fis, USERS_KEYSTORE_PASSWORD);
+            }
+            return ks.getCertificate(alias);
+        }
+
+        private boolean passwordMatches(UserRecord user, String password) throws Exception {
+            if (user == null || password == null) {
+                return false;
+            }
+            byte[] computedHash = hashPasswordWithSalt(user.salt, password);
+            return MessageDigest.isEqual(user.passwordHash, computedHash);
+        }
+
+        private void discardSendRequestWithError(ObjectInputStream in, ObjectOutputStream out,
+                                                 int fileCount, String errorMessage) throws Exception {
+            for (int i = 0; i < fileCount; i++) {
+                String filename = (String) in.readObject();
+                long fileSize = in.readLong();
+                discardBytes(in, fileSize);
+                out.writeObject(errorMessage + " para o ficheiro " + filename);
                 out.flush();
             }
         }

@@ -3,6 +3,7 @@ import java.net.*;
 import java.nio.file.Files;
 import java.security.*;
 import java.security.cert.Certificate;
+import java.security.cert.CertificateFactory;
 import java.util.*;
 import javax.net.ssl.SSLException;
 import javax.net.ssl.SSLHandshakeException;
@@ -94,11 +95,7 @@ public class mySaude {
         int    serverPort = -1;
         boolean needsServer = isNetworkCommand(command);
 
-        if (needsServer) {
-            if (serverAddr == null) {
-                System.err.println("Error: -s <address:port> is required for command " + command);
-                System.exit(1);
-            }
+        if (serverAddr != null) {
             int colonIdx = serverAddr.lastIndexOf(':');
             if (colonIdx < 0) {
                 System.err.println("Error: invalid server address format. Expected <ip>:<port>, got: " + serverAddr);
@@ -113,21 +110,32 @@ public class mySaude {
             }
         }
 
+        if (needsServer) {
+            if (serverAddr == null) {
+                System.err.println("Error: -s <address:port> is required for command " + command);
+                System.exit(1);
+            }
+            if (password == null) {
+                System.err.println("Error: -p <password> is required for server authentication in command " + command);
+                System.exit(1);
+            }
+        }
+
         // --- Dispatch ---
         switch (command) {
             case "-e":
                 if (target == null) { System.err.println("Error: -t <destinatario> is required for -e"); System.exit(1); }
-                sendFiles(serverHost, serverPort, username, files, target);
+                sendFiles(serverHost, serverPort, username, password, files, target);
                 break;
 
             case "-r":
-                receiveFiles(serverHost, serverPort, username, files);
+                receiveFiles(serverHost, serverPort, username, password, files);
                 break;
 
             case "-c":
                 if (target == null) { System.err.println("Error: -t <destinatario> is required for -c"); System.exit(1); }
                 if (password == null) { System.err.println("Error: -p <password> is required for -c"); System.exit(1); }
-                encryptFiles(username, password, files, target);
+                encryptFiles(username, password, files, target, serverHost, serverPort);
                 break;
 
             case "-d":
@@ -154,7 +162,7 @@ public class mySaude {
             case "-v":
                 if (password == null) { System.err.println("Error: -p <password> is required for -v"); System.exit(1); }
                 if (target == null) { System.err.println("Error: -t <quem_assinou> is required for -v"); System.exit(1); }
-                verifyFiles(username, password, files, target);
+                verifyFiles(username, password, files, target, serverHost, serverPort);
                 break;
 
             case "-ae":
@@ -193,6 +201,7 @@ public class mySaude {
     // Protocol (must match mySaudeServer.handleSend):
     //   C→S  "SEND"
     //   C→S  senderUsername   (writeObject)
+    //   C→S  password         (writeObject)
     //   C→S  targetUsername   (writeObject)
     //   C→S  fileCount        (writeInt)
     //   for each file:
@@ -202,7 +211,7 @@ public class mySaude {
     //     S→C  "OK:..."  or  "ERROR:..."  (readObject)
     // -------------------------------------------------------------------------
 
-    static void sendFiles(String host, int port, String username,
+    static void sendFiles(String host, int port, String username, String password,
                           List<String> files, String target) {
 
         // Client-side check: filter files that don't exist locally before connecting
@@ -226,9 +235,10 @@ public class mySaude {
             out.flush();
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
-            // 1. Command + sender + target + number of files
+            // 1. Command + sender + password + target + number of files
             out.writeObject("SEND");
             out.writeObject(username);
+            out.writeObject(password);
             out.writeObject(target);
             out.writeInt(validFiles.size());
             out.flush();
@@ -276,6 +286,7 @@ public class mySaude {
     // Protocol (must match mySaudeServer.handleReceive):
     //   C→S  "RECEIVE"
     //   C→S  username         (writeObject)
+    //   C→S  password         (writeObject)
     //   C→S  fileCount        (writeInt)
     //   for each file:
     //     C→S  filename       (writeObject)
@@ -288,7 +299,7 @@ public class mySaude {
     //       S→C  errorMessage (readObject)
     // -------------------------------------------------------------------------
 
-    static void receiveFiles(String host, int port, String username, List<String> files) {
+    static void receiveFiles(String host, int port, String username, String password, List<String> files) {
 
         // Client-side check: skip files that already exist locally before connecting
         List<String> toReceive = new ArrayList<>();
@@ -311,9 +322,10 @@ public class mySaude {
             out.flush();
             ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
 
-            // 1. Command + username + number of files
+            // 1. Command + username + password + number of files
             out.writeObject("RECEIVE");
             out.writeObject(username);
+            out.writeObject(password);
             out.writeInt(toReceive.size());
             out.flush();
 
@@ -373,24 +385,14 @@ public class mySaude {
     // -------------------------------------------------------------------------
 
     static void encryptFiles(String username, String password,
-                             List<String> files, String target) {
+                             List<String> files, String target,
+                             String serverHost, int serverPort) {
         KeyStore ks = loadKeyStore(username, password);
         if (ks == null) return;
 
-        // Get recipient's public key from their certificate stored in our keystore
-        Certificate cert;
-        try {
-            cert = ks.getCertificate(target);
-        } catch (KeyStoreException e) {
-            System.err.println("Error accessing keystore: " + e.getMessage());
-            return;
-        }
-        if (cert == null) {
-            System.err.println("Error: certificate for '" + target + "' not found in keystore." +
-                " Import it first: keytool -importcert -alias " + target +
-                " -keystore keystore." + username + " -file " + target + ".cer");
-            return;
-        }
+        // Get recipient's public key from local keystore or fetch it from the server.
+        Certificate cert = getCertificateOrFetch(ks, username, password, target, serverHost, serverPort);
+        if (cert == null) return;
         PublicKey recipientPublicKey = cert.getPublicKey();
 
         for (String filePath : files) {
@@ -557,7 +559,7 @@ public class mySaude {
                                 List<String> files, String target) {
 
         // 1) Cifrar localmente
-        encryptFiles(username, password, files, target);
+        encryptFiles(username, password, files, target, host, port);
 
         // 2) Preparar lista dos ficheiros gerados
         List<String> generatedFiles = new ArrayList<>();
@@ -583,7 +585,7 @@ public class mySaude {
         }
 
         // 3) Enviar para o servidor
-        sendFiles(host, port, username, generatedFiles, target);
+        sendFiles(host, port, username, password, generatedFiles, target);
     }
 
 
@@ -599,7 +601,7 @@ public class mySaude {
         }
 
         // 1) Receber do servidor os ficheiros necessários
-        receiveFiles(host, port, username, filesToReceive);
+        receiveFiles(host, port, username, password, filesToReceive);
 
         // 2) Decifrar os .cifrado recebidos
         List<String> encryptedFiles = new ArrayList<>();
@@ -663,23 +665,13 @@ public class mySaude {
     }
 
 
-    static void verifyFiles(String username, String password, List<String> files, String signer) {
+    static void verifyFiles(String username, String password, List<String> files, String signer,
+                            String serverHost, int serverPort) {
         KeyStore ks = loadKeyStore(username, password);
         if (ks == null) return;
 
-        Certificate cert;
-        try {
-            cert = ks.getCertificate(signer);
-        } catch (KeyStoreException e) {
-            System.err.println("Error accessing keystore: " + e.getMessage());
-            return;
-        }
-        if (cert == null) {
-            System.err.println("Error: certificate for signer '" + signer + "' not found in keystore." +
-                " Import it first: keytool -importcert -alias " + signer +
-                " -keystore keystore." + username + " -file " + signer + ".cer");
-            return;
-        }
+        Certificate cert = getCertificateOrFetch(ks, username, password, signer, serverHost, serverPort);
+        if (cert == null) return;
         PublicKey publicKey = cert.getPublicKey();
 
         for (String filePath : files) {
@@ -760,7 +752,7 @@ public class mySaude {
             return;
         }
 
-        sendFiles(host, port, username, generatedFiles, target);
+        sendFiles(host, port, username, password, generatedFiles, target);
     }
 
 
@@ -775,7 +767,7 @@ public class mySaude {
             filesToReceive.add(name + ".assinatura." + signer);
         }
 
-        receiveFiles(host, port, username, filesToReceive);
+        receiveFiles(host, port, username, password, filesToReceive);
 
         for (String name : files) {
             File signedFile = new File(name + ".assinado");
@@ -791,7 +783,7 @@ public class mySaude {
             }
         }
 
-        verifyFiles(username, password, files, signer);
+        verifyFiles(username, password, files, signer, host, port);
     }
 
 
@@ -809,11 +801,8 @@ public class mySaude {
                 return;
             }
 
-            Certificate cert = ks.getCertificate(target);
-            if (cert == null) {
-                System.err.println("Error: certificate for target '" + target + "' not found in keystore.");
-                return;
-            }
+            Certificate cert = getCertificateOrFetch(ks, username, password, target, host, port);
+            if (cert == null) return;
 
             PublicKey recipientPublicKey = cert.getPublicKey();
 
@@ -902,7 +891,7 @@ public class mySaude {
                 return;
             }
 
-            sendFiles(host, port, username, generatedFiles, target);
+            sendFiles(host, port, username, password, generatedFiles, target);
 
         } catch (Exception e) {
             System.err.println("Error in -ace: " + e.getMessage());
@@ -923,7 +912,7 @@ public class mySaude {
         }
 
         // 1) Receber os ficheiros do servidor
-        receiveFiles(host, port, username, filesToReceive);
+        receiveFiles(host, port, username, password, filesToReceive);
 
         // 2) Decifrar os envelopes recebidos
         try {
@@ -989,7 +978,7 @@ public class mySaude {
         }
 
         // 3) Verificar assinatura do ficheiro decifrado
-        verifyFiles(username, password, files, signer);
+        verifyFiles(username, password, files, signer, host, port);
     }
 
 
@@ -1019,6 +1008,82 @@ public class mySaude {
         }
     }
 
+
+    static void saveKeyStore(KeyStore ks, String username, String password) throws Exception {
+        String ksPath = "keystore." + username;
+        try (FileOutputStream fos = new FileOutputStream(ksPath)) {
+            ks.store(fos, password.toCharArray());
+        }
+    }
+
+    static Certificate getCertificateOrFetch(KeyStore ks, String username, String password,
+                                             String requestedUser, String serverHost, int serverPort) {
+        try {
+            Certificate cert = ks.getCertificate(requestedUser);
+            if (cert != null) return cert;
+        } catch (KeyStoreException e) {
+            System.err.println("Error accessing keystore: " + e.getMessage());
+            return null;
+        }
+
+        if (serverHost == null || serverPort <= 0) {
+            System.err.println("Error: certificate for '" + requestedUser + "' not found in keystore." +
+                    " Use -s <server:port> so mySaude can request it from the server, or import it manually.");
+            return null;
+        }
+
+        Certificate cert = requestCertificateFromServer(serverHost, serverPort, username, password, requestedUser);
+        if (cert == null) return null;
+
+        try {
+            ks.setCertificateEntry(requestedUser, cert);
+            saveKeyStore(ks, username, password);
+            System.out.println("Certificate for '" + requestedUser + "' imported into keystore." + username);
+            return cert;
+        } catch (Exception e) {
+            System.err.println("Error saving certificate for '" + requestedUser + "' in keystore." + username + ": " + e.getMessage());
+            return null;
+        }
+    }
+
+    static Certificate requestCertificateFromServer(String host, int port, String username,
+                                                    String password, String requestedUser) {
+        try (SSLSocket socket = createTlsSocket(host, port)) {
+            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+            out.flush();
+            ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+
+            out.writeObject("GET_CERT");
+            out.writeObject(username);
+            out.writeObject(password);
+            out.writeObject(requestedUser);
+            out.flush();
+
+            String status = (String) in.readObject();
+            if ("OK".equals(status)) {
+                byte[] certBytes = (byte[]) in.readObject();
+                CertificateFactory cf = CertificateFactory.getInstance("X.509");
+                try (ByteArrayInputStream bis = new ByteArrayInputStream(certBytes)) {
+                    return cf.generateCertificate(bis);
+                }
+            }
+
+            String errorMsg = (String) in.readObject();
+            System.err.println("Error requesting certificate for '" + requestedUser + "': " + errorMsg);
+            return null;
+
+        } catch (ConnectException e) {
+            System.err.println("Error: cannot connect to server at " + host + ":" + port);
+        } catch (SSLHandshakeException e) {
+            System.err.println("TLS handshake failed while requesting certificate: " + e.getMessage());
+        } catch (SSLException e) {
+            System.err.println("TLS error while requesting certificate: " + e.getMessage());
+        } catch (Exception e) {
+            System.err.println("Error requesting certificate from server: " + e.getMessage());
+        }
+        return null;
+    }
+
     // -------------------------------------------------------------------------
     // Helpers
     // -------------------------------------------------------------------------
@@ -1044,8 +1109,8 @@ public class mySaude {
 
     private static void printUsage() {
         System.out.println("Usage:");
-        System.out.println("  mySaude -s <addr:port> -u <user> -e <files...> -t <dest>");
-        System.out.println("  mySaude -s <addr:port> -u <user> -r <files...>");
+        System.out.println("  mySaude -s <addr:port> -u <user> -p <pass> -e <files...> -t <dest>");
+        System.out.println("  mySaude -s <addr:port> -u <user> -p <pass> -r <files...>");
         System.out.println("  mySaude -u <user> -p <pass> -c <files...> -t <dest>");
         System.out.println("  mySaude -u <user> -p <pass> -d <files...>");
         System.out.println("  mySaude -s <addr:port> -u <user> -p <pass> -ce <files...> -t <dest>");

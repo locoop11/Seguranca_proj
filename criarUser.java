@@ -39,7 +39,7 @@ public class criarUser {
     }
 
     private static void run(String[] args) throws Exception {
-        if (args.length != 6 || !"-f".equals(args[3])) {
+        if (args.length != 5 || !"-f".equals(args[3])) {
             System.err.println("Uso: criarUser <username> <funcao> <password> -f <ficheiro com o certificado do utilizador>");
             throw new IllegalArgumentException("Argumentos inválidos.");
         }
@@ -71,15 +71,11 @@ public class criarUser {
             throw new IllegalArgumentException("Username já existe: " + username);
         }
 
+
+        // 1) Carregar certificado primeiro
         Certificate cert = loadX509Certificate(certPath);
 
-        // 1) Adicionar user ao ficheiro users (salt + hash)
-        byte[] salt = generateSalt();
-        byte[] hash = hashPasswordWithSalt(salt, password);
-        String line = formatUserLine(username, role, salt, hash);
-        appendLineToUsers(line);
-
-        // 2) Criar diretoria server_storage/<username>/
+        // 2) Criar diretoria server_storage/<username>/ antes de mexer no users
         File userDir = new File(STORAGE_DIR, username);
         if (!userDir.exists() && !userDir.mkdirs()) {
             throw new IOException("Não foi possível criar a diretoria do utilizador: " + userDir.getPath());
@@ -88,7 +84,13 @@ public class criarUser {
         // 3) Adicionar certificado à keystore.users com alias = username
         upsertCertificateInUsersKeyStore(username, cert);
 
-        // 4) Atualizar MAC após alteração do ficheiro users
+        // 4) Só agora adicionar user ao ficheiro users
+        byte[] salt = generateSalt();
+        byte[] hash = hashPasswordWithSalt(salt, password);
+        String line = formatUserLine(username, role, salt, hash);
+        appendLineToUsers(line);
+
+        // 5) Atualizar MAC após alteração do ficheiro users
         updateUsersMacAfterChange(macKey);
 
         System.out.println("Utilizador criado com sucesso: " + username + " (" + role + ")");
